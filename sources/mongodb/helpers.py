@@ -27,17 +27,20 @@ else:
 
 
 class CollectionLoader:
+
     def __init__(
         self,
         client: TMongoClient,
         collection: TCollection,
         chunk_size: int,
+        filter: Dict[str, Any],
         incremental: Optional[dlt.sources.incremental[Any]] = None,
     ) -> None:
         self.client = client
         self.collection = collection
         self.incremental = incremental
         self.chunk_size = chunk_size
+        self.filter = filter
 
         if incremental:
             self.cursor_field = incremental.cursor_path
@@ -47,7 +50,7 @@ class CollectionLoader:
             self.last_value = None
 
     @property
-    def _sort_op(self) -> List[Optional[Tuple[str, int]]]:
+    def _sort_op(self) -> List[Tuple[str, int]]:
         if not self.incremental or not self.last_value:
             return []
 
@@ -81,22 +84,34 @@ class CollectionLoader:
             Dict[str, Any]: A dictionary with the filter operator.
         """
         if not (self.incremental and self.last_value):
-            return {}
+            return self.filter
 
         filt = {}
         if self.incremental.last_value_func is max:
-            filt = {self.cursor_field: {"$gte": self.last_value}}
+            filt[self.cursor_field] = {"$gte": self.last_value}
             if self.incremental.end_value:
-                filt[self.cursor_field]["$lt"] = self.incremental.end_value
+                filt[self.cursor_field].update({"$lt": self.incremental.end_value})
 
         elif self.incremental.last_value_func is min:
-            filt = {self.cursor_field: {"$lte": self.last_value}}
+            filt[self.cursor_field] = {"$lte": self.last_value}
             if self.incremental.end_value:
-                filt[self.cursor_field]["$gt"] = self.incremental.end_value
+                filt[self.cursor_field].update({"$gt": self.incremental.end_value})
+
+        # Merge self.filter carefully
+        for field, condition in self.filter.items():
+            if field == self.cursor_field:
+                filt[self.cursor_field] = {
+                    **condition,
+                    **filt.get(self.cursor_field, {}),
+                }
+            else:
+                filt[field] = condition
 
         return filt
 
-    def _limit(self, cursor: Cursor, limit: Optional[int] = None) -> Cursor:  # type: ignore
+    def _limit(
+        self, cursor: Cursor, limit: Optional[int] = None
+    ) -> Cursor:  # type: ignore
         """Apply a limit to the cursor, if needed.
 
         Args:
@@ -136,6 +151,7 @@ class CollectionLoader:
 
 
 class CollectionLoaderParallel(CollectionLoader):
+
     def _get_document_count(self) -> int:
         return self.collection.count_documents(filter=self._filter_op)
 
@@ -204,7 +220,8 @@ def collection_documents(
     incremental: Optional[dlt.sources.incremental[Any]] = None,
     parallel: bool = False,
     limit: Optional[int] = None,
-    chunk_size: Optional[int] = 10000,
+    chunk_size: int = 10000,
+    filter: Dict[str, Any] = {},
 ) -> Iterator[TDataItem]:
     """
     A DLT source which loads data from a Mongo database using PyMongo.
@@ -224,7 +241,11 @@ def collection_documents(
     LoaderClass = CollectionLoaderParallel if parallel else CollectionLoader
 
     loader = LoaderClass(
-        client, collection, incremental=incremental, chunk_size=chunk_size
+        client,
+        collection,
+        incremental=incremental,
+        chunk_size=chunk_size,
+        filter=filter,
     )
     for data in loader.load_documents(limit=limit):
         yield data
